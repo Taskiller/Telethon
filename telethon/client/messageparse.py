@@ -67,7 +67,7 @@ class MessageParseMethods:
                 entities[i].offset, entities[i].length,
                 await self.get_input_entity(user)
             )
-            return True            
+            return True
         except (ValueError, TypeError):
             return False
 
@@ -134,7 +134,7 @@ class MessageParseMethods:
 
                 # Pinning a message with `updatePinnedMessage` seems to
                 # always produce a service message we can't map so return
-                # it directly.
+                # it directly. The same happens for kicking users.
                 #
                 # It could also be a list (e.g. when sending albums).
                 #
@@ -157,7 +157,7 @@ class MessageParseMethods:
 
             elif (isinstance(update, types.UpdateEditChannelMessage)
                   and utils.get_peer_id(request.peer) ==
-                  utils.get_peer_id(update.message.to_id)):
+                  utils.get_peer_id(update.message.peer_id)):
                 if request.id == update.message.id:
                     update.message._finish_init(self, entities, input_chat)
                     return update.message
@@ -170,7 +170,7 @@ class MessageParseMethods:
                 if request.media.poll.id == update.poll_id:
                     m = types.Message(
                         id=request.id,
-                        to_id=utils.get_peer(request.peer),
+                        peer_id=utils.get_peer(request.peer),
                         media=types.MessageMediaPoll(
                             poll=update.poll,
                             results=update.results
@@ -193,7 +193,13 @@ class MessageParseMethods:
             mapping = sched_to_message
             opposite = id_to_message  # scheduled may be treated as normal, though
 
-        random_id = request if isinstance(request, (int, list)) else request.random_id
+        random_id = request if isinstance(request, (int, list)) else getattr(request, 'random_id', None)
+        if random_id is None:
+            # Can happen when pinning a message does not actually produce a service message.
+            self._log[__name__].warning(
+                'No random_id in %s to map to, returning None message for %s', request, result)
+            return None
+
         if not utils.is_list_like(random_id):
             msg = mapping.get(random_to_id.get(random_id))
             if not msg:

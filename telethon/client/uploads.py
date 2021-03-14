@@ -53,6 +53,11 @@ def _resize_photo_if_needed(
         # Don't use a `with` block for `image`, or `file` would be closed.
         # See https://github.com/LonamiWebs/Telethon/issues/1121 for more.
         image = PIL.Image.open(file)
+        try:
+            kwargs = {'exif': image.info['exif']}
+        except KeyError:
+            kwargs = {}
+
         if image.width <= width and image.height <= height:
             return file
 
@@ -72,7 +77,7 @@ def _resize_photo_if_needed(
             result.paste(image, mask=image.split()[alpha_index])
 
         buffer = io.BytesIO()
-        result.save(buffer, 'JPEG')
+        result.save(buffer, 'JPEG', **kwargs)
         buffer.seek(0)
         return buffer
 
@@ -102,12 +107,14 @@ class UploadMethods:
             thumb: 'hints.FileLike' = None,
             allow_cache: bool = True,
             parse_mode: str = (),
+            formatting_entities: typing.Optional[typing.List[types.TypeMessageEntity]] = None,
             voice_note: bool = False,
             video_note: bool = False,
             buttons: 'hints.MarkupLike' = None,
             silent: bool = None,
             supports_streaming: bool = False,
             schedule: 'hints.DateLike' = None,
+            comment_to: 'typing.Union[int, types.Message]' = None,
             **kwargs) -> 'types.Message':
         """
         Sends message with the given file to the specified entity.
@@ -200,9 +207,14 @@ class UploadMethods:
                 Optional JPEG thumbnail (for documents). **Telegram will
                 ignore this parameter** unless you pass a ``.jpg`` file!
 
-                The file must also be small in dimensions and in-disk size.
-                Successful thumbnails were files below 20kb and 200x200px.
+                The file must also be small in dimensions and in disk size.
+                Successful thumbnails were files below 20kB and 320x320px.
                 Width/height and dimensions/size ratios may be important.
+                For Telegram to accept a thumbnail, you must provide the
+                dimensions of the underlying media through ``attributes=``
+                with :tl:`DocumentAttributesVideo` or by installing the
+                optional ``hachoir`` dependency.
+
 
             allow_cache (`bool`, optional):
                 This parameter currently does nothing, but is kept for
@@ -214,6 +226,9 @@ class UploadMethods:
                 <telethon.client.messageparse.MessageParseMethods.parse_mode>`
                 property for allowed values. Markdown parsing will be used by
                 default.
+
+            formatting_entities (`list`, optional):
+                A list of message formatting entities. When provided, the ``parse_mode`` is ignored.
 
             voice_note (`bool`, optional):
                 If `True` the audio will be sent as a voice note.
@@ -245,6 +260,14 @@ class UploadMethods:
                 If set, the file won't send immediately, and instead
                 it will be scheduled to be automatically sent at a later
                 time.
+
+            comment_to (`int` | `Message <telethon.tl.custom.message.Message>`, optional):
+                Similar to ``reply_to``, but replies in the linked group of a
+                broadcast channel instead (effectively leaving a "comment to"
+                the specified message).
+
+                This parameter takes precedence over ``reply_to``. If there is
+                no linked chat, `telethon.errors.sgIdInvalidError` is raised.
 
         Returns
             The `Message <telethon.tl.custom.message.Message>` (or messages)
@@ -303,42 +326,33 @@ class UploadMethods:
         if not caption:
             caption = ''
 
+        entity = await self.get_input_entity(entity)
+        if comment_to is not None:
+            entity, reply_to = await self._get_comment_data(entity, comment_to)
+        else:
+            reply_to = utils.get_message_id(reply_to)
+
         # First check if the user passed an iterable, in which case
-        # we may want to send as an album if all are photo files.
+        # we may want to send grouped.
         if utils.is_list_like(file):
-            media_captions = []
-            document_captions = []
             if utils.is_list_like(caption):
                 captions = caption
             else:
                 captions = [caption]
 
-            # TODO Fix progress_callback
-            media = []
-            if force_document:
-                documents = file
-            else:
-                documents = []
-                for doc, cap in itertools.zip_longest(file, captions):
-                    if utils.is_image(doc) or utils.is_video(doc):
-                        media.append(doc)
-                        media_captions.append(cap)
-                    else:
-                        documents.append(doc)
-                        document_captions.append(cap)
-
             result = []
-            while media:
+            while file:
                 result += await self._send_album(
-                    entity, media[:10], caption=media_captions[:10],
+                    entity, file[:10], caption=captions[:10],
                     progress_callback=progress_callback, reply_to=reply_to,
                     parse_mode=parse_mode, silent=silent, schedule=schedule,
-                    supports_streaming=supports_streaming, clear_draft=clear_draft
+                    supports_streaming=supports_streaming, clear_draft=clear_draft,
+                    force_document=force_document
                 )
-                media = media[10:]
-                media_captions = media_captions[10:]
+                file = file[10:]
+                captions = captions[10:]
 
-            for doc, cap in zip(documents, captions):
+            for doc, cap in zip(file, captions):
                 result.append(await self.send_file(
                     entity, doc, allow_cache=allow_cache,
                     caption=cap, force_document=force_document,
@@ -352,13 +366,8 @@ class UploadMethods:
 
             return result
 
-        entity = await self.get_input_entity(entity)
-        reply_to = utils.get_message_id(reply_to)
-
-        # Not document since it's subject to change.
-        # Needed when a Message is passed to send_message and it has media.
-        if 'entities' in kwargs:
-            msg_entities = kwargs['entities']
+        if formatting_entities is not None:
+            msg_entities = formatting_entities
         else:
             caption, msg_entities =\
                 await self._parse_message_text(caption, parse_mode)
@@ -387,7 +396,8 @@ class UploadMethods:
     async def _send_album(self: 'TelegramClient', entity, files, caption='',
                           progress_callback=None, reply_to=None,
                           parse_mode=(), silent=None, schedule=None,
-                          supports_streaming=None, clear_draft=None):
+                          supports_streaming=None, clear_draft=None,
+                          force_document=False):
         """Specialized version of .send_file for albums"""
         # We don't care if the user wants to avoid cache, we will use it
         # anyway. Why? The cached version will be exactly the same thing
@@ -416,8 +426,9 @@ class UploadMethods:
             # make it `raise MediaInvalidError`, so we need to upload
             # it as media and then convert that to :tl:`InputMediaPhoto`.
             fh, fm, _ = await self._file_to_media(
-                file, supports_streaming=supports_streaming)
-            if isinstance(fm, types.InputMediaUploadedPhoto):
+                file, supports_streaming=supports_streaming,
+                force_document=force_document)
+            if isinstance(fm, (types.InputMediaUploadedPhoto, types.InputMediaPhotoExternal)):
                 r = await self(functions.messages.UploadMediaRequest(
                     entity, media=fm
                 ))
@@ -540,83 +551,43 @@ class UploadMethods:
         if isinstance(file, (types.InputFile, types.InputFileBig)):
             return file  # Already uploaded
 
-        if not file_name and getattr(file, 'name', None):
-            file_name = file.name
-
-        if file_size is not None:
-            pass  # do nothing as it's already kwown
-        elif isinstance(file, str):
-            file_size = os.path.getsize(file)
-            stream = open(file, 'rb')
-            close_stream = True
-        elif isinstance(file, bytes):
-            file_size = len(file)
-            stream = io.BytesIO(file)
-            close_stream = True
-        else:
-            if not callable(getattr(file, 'read', None)):
-                raise TypeError('file description should have a `read` method')
-
-            if callable(getattr(file, 'seekable', None)):
-                seekable = await helpers._maybe_await(file.seekable())
-            else:
-                seekable = False
-
-            if seekable:
-                pos = await helpers._maybe_await(file.tell())
-                await helpers._maybe_await(file.seek(0, os.SEEK_END))
-                file_size = await helpers._maybe_await(file.tell())
-                await helpers._maybe_await(file.seek(pos, os.SEEK_SET))
-
-                stream = file
-                close_stream = False
-            else:
-                self._log[__name__].warning(
-                    'Could not determine file size beforehand so the entire '
-                    'file will be read in-memory')
-
-                data = await helpers._maybe_await(file.read())
-                stream = io.BytesIO(data)
-                close_stream = True
-                file_size = len(data)
-
-        # File will now either be a string or bytes
-        if not part_size_kb:
-            part_size_kb = utils.get_appropriated_part_size(file_size)
-
-        if part_size_kb > 512:
-            raise ValueError('The part size must be less or equal to 512KB')
-
-        part_size = int(part_size_kb * 1024)
-        if part_size % 1024 != 0:
-            raise ValueError(
-                'The part size must be evenly divisible by 1024')
-
-        # Set a default file name if None was specified
-        file_id = helpers.generate_random_long()
-        if not file_name:
-            if isinstance(file, str):
-                file_name = os.path.basename(file)
-            else:
-                file_name = str(file_id)
-
-        # If the file name lacks extension, add it if possible.
-        # Else Telegram complains with `PHOTO_EXT_INVALID_ERROR`
-        # even if the uploaded image is indeed a photo.
-        if not os.path.splitext(file_name)[-1]:
-            file_name += utils._get_extension(file)
-
-        # Determine whether the file is too big (over 10MB) or not
-        # Telegram does make a distinction between smaller or larger files
-        is_big = file_size > 10 * 1024 * 1024
-        hash_md5 = hashlib.md5()
-
-        part_count = (file_size + part_size - 1) // part_size
-        self._log[__name__].info('Uploading file of %d bytes in %d chunks of %d',
-                                 file_size, part_count, part_size)
-
         pos = 0
-        try:
+        async with helpers._FileStream(file, file_size=file_size) as stream:
+            # Opening the stream will determine the correct file size
+            file_size = stream.file_size
+
+            if not part_size_kb:
+                part_size_kb = utils.get_appropriated_part_size(file_size)
+
+            if part_size_kb > 512:
+                raise ValueError('The part size must be less or equal to 512KB')
+
+            part_size = int(part_size_kb * 1024)
+            if part_size % 1024 != 0:
+                raise ValueError(
+                    'The part size must be evenly divisible by 1024')
+
+            # Set a default file name if None was specified
+            file_id = helpers.generate_random_long()
+            if not file_name:
+                file_name = stream.name or str(file_id)
+
+            # If the file name lacks extension, add it if possible.
+            # Else Telegram complains with `PHOTO_EXT_INVALID_ERROR`
+            # even if the uploaded image is indeed a photo.
+            if not os.path.splitext(file_name)[-1]:
+                file_name += utils._get_extension(stream)
+
+            # Determine whether the file is too big (over 10MB) or not
+            # Telegram does make a distinction between smaller or larger files
+            is_big = file_size > 10 * 1024 * 1024
+            hash_md5 = hashlib.md5()
+
+            part_count = (file_size + part_size - 1) // part_size
+            self._log[__name__].info('Uploading file of %d bytes in %d chunks of %d',
+                                    file_size, part_count, part_size)
+
+            pos = 0
             for part_index in range(part_count):
                 # Read the file by in chunks of size part_size
                 part = await helpers._maybe_await(stream.read(part_size))
@@ -663,9 +634,6 @@ class UploadMethods:
                 else:
                     raise RuntimeError(
                         'Failed to upload file part {}.'.format(part_index))
-        finally:
-            if close_stream:
-                await helpers._maybe_await(stream.close())
 
         if is_big:
             return types.InputFileBig(file_id, part_count, file_name)
@@ -753,7 +721,8 @@ class UploadMethods:
                 force_document=force_document and not is_image,
                 voice_note=voice_note,
                 video_note=video_note,
-                supports_streaming=supports_streaming
+                supports_streaming=supports_streaming,
+                thumb=thumb
             )
 
             if not thumb:

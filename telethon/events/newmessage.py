@@ -1,6 +1,7 @@
 import re
 
 from .common import EventBuilder, EventCommon, name_inner_event, _into_id_set
+from .. import utils
 from ..tl import types
 
 
@@ -106,16 +107,15 @@ class NewMessage(EventBuilder):
                 media_unread=update.media_unread,
                 silent=update.silent,
                 id=update.id,
-                # Note that to_id/from_id complement each other in private
-                # messages, depending on whether the message was outgoing.
-                to_id=types.PeerUser(update.user_id if update.out else self_id),
-                from_id=self_id if update.out else update.user_id,
+                peer_id=types.PeerUser(update.user_id),
+                from_id=types.PeerUser(self_id if update.out else update.user_id),
                 message=update.message,
                 date=update.date,
                 fwd_from=update.fwd_from,
                 via_bot_id=update.via_bot_id,
-                reply_to_msg_id=update.reply_to_msg_id,
-                entities=update.entities
+                reply_to=update.reply_to,
+                entities=update.entities,
+                ttl_period=update.ttl_period
             ))
         elif isinstance(update, types.UpdateShortChatMessage):
             event = cls.Event(types.Message(
@@ -124,24 +124,18 @@ class NewMessage(EventBuilder):
                 media_unread=update.media_unread,
                 silent=update.silent,
                 id=update.id,
-                from_id=update.from_id,
-                to_id=types.PeerChat(update.chat_id),
+                from_id=types.PeerUser(self_id if update.out else update.from_id),
+                peer_id=types.PeerChat(update.chat_id),
                 message=update.message,
                 date=update.date,
                 fwd_from=update.fwd_from,
                 via_bot_id=update.via_bot_id,
-                reply_to_msg_id=update.reply_to_msg_id,
-                entities=update.entities
+                reply_to=update.reply_to,
+                entities=update.entities,
+                ttl_period=update.ttl_period
             ))
         else:
             return
-
-        # Make messages sent to ourselves outgoing unless they're forwarded.
-        # This makes it consistent with official client's appearance.
-        ori = event.message
-        if isinstance(ori.to_id, types.PeerUser):
-            if ori.from_id == ori.to_id.user_id and not ori.fwd_from:
-                event.message.out = True
 
         return event
 
@@ -158,7 +152,7 @@ class NewMessage(EventBuilder):
                 return
 
         if self.from_users is not None:
-            if event.message.from_id not in self.from_users:
+            if event.message.sender_id not in self.from_users:
                 return
 
         if self.pattern:
@@ -204,14 +198,7 @@ class NewMessage(EventBuilder):
         """
         def __init__(self, message):
             self.__dict__['_init'] = False
-            if not message.out and isinstance(message.to_id, types.PeerUser):
-                # Incoming message (e.g. from a bot) has to_id=us, and
-                # from_id=bot (the actual "chat" from a user's perspective).
-                chat_peer = types.PeerUser(message.from_id)
-            else:
-                chat_peer = message.to_id
-
-            super().__init__(chat_peer=chat_peer,
+            super().__init__(chat_peer=message.peer_id,
                              msg_id=message.id, broadcast=bool(message.post))
 
             self.pattern_match = None

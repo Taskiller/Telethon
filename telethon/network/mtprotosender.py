@@ -16,10 +16,11 @@ from ..errors import (
 from ..extensions import BinaryReader
 from ..tl.core import RpcResult, MessageContainer, GzipPacked
 from ..tl.functions.auth import LogOutRequest
+from ..tl.functions import PingRequest, DestroySessionRequest
 from ..tl.types import (
     MsgsAck, Pong, BadServerSalt, BadMsgNotification, FutureSalts,
     MsgNewDetailedInfo, NewSessionCreated, MsgDetailedInfo, MsgsStateReq,
-    MsgsStateInfo, MsgsAllInfo, MsgResendReq, upload
+    MsgsStateInfo, MsgsAllInfo, MsgResendReq, upload, DestroySessionOk, DestroySessionNone,
 )
 from ..crypto import AuthKey
 from ..helpers import retry_range
@@ -55,6 +56,7 @@ class MTProtoSender:
         self._update_callback = update_callback
         self._auto_reconnect_callback = auto_reconnect_callback
         self._connect_lock = asyncio.Lock()
+        self._ping = None
 
         # Whether the user has explicitly connected or disconnected.
         #
@@ -106,6 +108,8 @@ class MTProtoSender:
             MsgsStateReq.CONSTRUCTOR_ID: self._handle_state_forgotten,
             MsgResendReq.CONSTRUCTOR_ID: self._handle_state_forgotten,
             MsgsAllInfo.CONSTRUCTOR_ID: self._handle_msg_all,
+            DestroySessionOk: self._handle_destroy_session,
+            DestroySessionNone: self._handle_destroy_session,
         }
 
     # Public API
@@ -217,7 +221,7 @@ class MTProtoSender:
         self._log.info('Connecting to %s...', self._connection)
 
         connected = False
-        
+
         for attempt in retry_range(self._retries):
             if not connected:
                 connected = await self._try_connect(attempt)
@@ -338,7 +342,7 @@ class MTProtoSender:
         """
         Cleanly disconnects and then reconnects.
         """
-        self._log.debug('Closing current connection...')
+        self._log.info('Closing current connection to begin reconnect...')
         await self._connection.disconnect()
 
         await helpers._cancel(
@@ -358,8 +362,9 @@ class MTProtoSender:
         self._state.reset()
 
         retries = self._retries if self._auto_reconnect else 0
-        
+
         attempt = 0
+        ok = True
         # We're already "retrying" to connect, so we don't want to force retries
         for attempt in retry_range(retries, force_retry=False):
             try:
@@ -369,6 +374,19 @@ class MTProtoSender:
                 self._log.info('Failed reconnection attempt %d with %s',
                                attempt, e.__class__.__name__)
                 await asyncio.sleep(self._delay)
+            except BufferError as e:
+                # TODO there should probably only be one place to except all these errors
+                if isinstance(e, InvalidBufferError) and e.code == 404:
+                    self._log.info('Broken authorization key; resetting')
+                    self.auth_key.key = None
+                    if self._auth_key_callback:
+                        self._auth_key_callback(None)
+
+                    ok = False
+                    break
+                else:
+                    self._log.warning('Invalid buffer %s', e)
+
             except Exception as e:
                 last_error = e
                 self._log.exception('Unexpected exception reconnecting on '
@@ -384,8 +402,13 @@ class MTProtoSender:
 
                 break
         else:
+            ok = False
+
+        if not ok:
             self._log.error('Automatic reconnection failed %d time(s)', attempt)
-            await self._disconnect(error=last_error.with_traceback(None))
+            # There may be no error (e.g. automatic reconnection was turned off).
+            error = last_error.with_traceback(None) if last_error else None
+            await self._disconnect(error=error)
 
     def _start_reconnect(self, error):
         """Starts a reconnection in the background."""
@@ -401,6 +424,18 @@ class MTProtoSender:
             # TODO It still gets stuck? Investigate where and why.
             self._reconnecting = True
             asyncio.get_event_loop().create_task(self._reconnect(error))
+
+    def _keepalive_ping(self, rnd_id):
+        """
+        Send a keep-alive ping. If a pong for the last ping was not received
+        yet, this means we're probably not connected.
+        """
+        # TODO this is ugly, update loop shouldn't worry about this, sender should
+        if self._ping is None:
+            self._ping = rnd_id
+            self.send(PingRequest(rnd_id))
+        else:
+            self._start_reconnect(None)
 
     # Loops
 
@@ -431,13 +466,12 @@ class MTProtoSender:
                             len(batch), len(data))
 
             data = self._state.encrypt_message_data(data)
-            try:
-                await self._connection.send(data)
-            except IOError as e:
-                self._log.info('Connection closed while sending data')
-                self._start_reconnect(e)
-                return
 
+            # Whether sending succeeds or not, the popped requests are now
+            # pending because they're removed from the queue. If a reconnect
+            # occurs, they will be removed from pending state and re-enqueued
+            # so even if the network fails they won't be lost. If they were
+            # never re-enqueued, the future waiting for a response "locks".
             for state in batch:
                 if not isinstance(state, list):
                     if isinstance(state.request, TLRequest):
@@ -446,6 +480,13 @@ class MTProtoSender:
                     for s in state:
                         if isinstance(s.request, TLRequest):
                             self._pending_state[s.msg_id] = s
+
+            try:
+                await self._connection.send(data)
+            except IOError as e:
+                self._log.info('Connection closed while sending data')
+                self._start_reconnect(e)
+                return
 
             self._log.debug('Encrypted messages put in a queue to be sent')
 
@@ -481,14 +522,14 @@ class MTProtoSender:
             except BufferError as e:
                 if isinstance(e, InvalidBufferError) and e.code == 404:
                     self._log.info('Broken authorization key; resetting')
+                    self.auth_key.key = None
+                    if self._auth_key_callback:
+                        self._auth_key_callback(None)
+
+                    await self._disconnect(error=e)
                 else:
                     self._log.warning('Invalid buffer %s', e)
-
-                self.auth_key.key = None
-                if self._auth_key_callback:
-                    self._auth_key_callback(None)
-
-                self._start_reconnect(e)
+                    self._start_reconnect(e)
                 return
             except Exception as e:
                 self._log.exception('Unhandled error while receiving data')
@@ -571,11 +612,16 @@ class MTProtoSender:
             if not state.future.cancelled():
                 state.future.set_exception(error)
         else:
-            with BinaryReader(rpc_result.body) as reader:
-                result = state.request.read_result(reader)
-
-            if not state.future.cancelled():
-                state.future.set_result(result)
+            try:
+                with BinaryReader(rpc_result.body) as reader:
+                    result = state.request.read_result(reader)
+            except Exception as e:
+                # e.g. TypeNotFoundError, should be propagated to caller
+                if not state.future.cancelled():
+                    state.future.set_exception(e)
+            else:
+                if not state.future.cancelled():
+                    state.future.set_result(result)
 
     async def _handle_container(self, message):
         """
@@ -618,6 +664,9 @@ class MTProtoSender:
         """
         pong = message.obj
         self._log.debug('Handling pong for message %d', pong.msg_id)
+        if self._ping == pong.ping_id:
+            self._ping = None
+
         state = self._pending_state.pop(pong.msg_id, None)
         if state:
             state.future.set_result(pong)
@@ -730,7 +779,8 @@ class MTProtoSender:
             state = self._pending_state.get(msg_id)
             if state and isinstance(state.request, LogOutRequest):
                 del self._pending_state[msg_id]
-                state.future.set_result(True)
+                if not state.future.cancelled():
+                    state.future.set_result(True)
 
     async def _handle_future_salts(self, message):
         """
@@ -760,3 +810,19 @@ class MTProtoSender:
         """
         Handles :tl:`MsgsAllInfo` by doing nothing (yet).
         """
+
+    async def _handle_destroy_session(self, message):
+        """
+        Handles both :tl:`DestroySessionOk` and :tl:`DestroySessionNone`.
+        It behaves pretty much like handling an RPC result.
+        """
+        for msg_id, state in self._pending_state.items():
+            if isinstance(state.request, DestroySessionRequest)\
+                    and state.request.session_id == message.obj.session_id:
+                break
+        else:
+            return
+
+        del self._pending_state[msg_id]
+        if not state.future.cancelled():
+            state.future.set_result(message.obj)

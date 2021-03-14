@@ -221,15 +221,17 @@ class _AdminLogIter(RequestIter):
     async def _init(
             self, entity, admins, search, min_id, max_id,
             join, leave, invite, restrict, unrestrict, ban, unban,
-            promote, demote, info, settings, pinned, edit, delete
+            promote, demote, info, settings, pinned, edit, delete,
+            group_call
     ):
         if any((join, leave, invite, restrict, unrestrict, ban, unban,
-                promote, demote, info, settings, pinned, edit, delete)):
+                promote, demote, info, settings, pinned, edit, delete,
+                group_call)):
             events_filter = types.ChannelAdminLogEventsFilter(
                 join=join, leave=leave, invite=invite, ban=restrict,
                 unban=unrestrict, kick=ban, unkick=unban, promote=promote,
                 demote=demote, info=info, settings=settings, pinned=pinned,
-                edit=edit, delete=delete
+                edit=edit, delete=delete, group_call=group_call
             )
         else:
             events_filter = None
@@ -337,25 +339,31 @@ class _ProfilePhotoIter(RequestIter):
             else:
                 self.request.offset += len(result.photos)
         else:
+            # Some broadcast channels have a photo that this request doesn't
+            # retrieve for whatever random reason the Telegram server feels.
+            #
+            # This means the `total` count may be wrong but there's not much
+            # that can be done around it (perhaps there are too many photos
+            # and this is only a partial result so it's not possible to just
+            # use the len of the result).
             self.total = getattr(result, 'count', None)
-            if self.total == 0 and isinstance(result, types.messages.ChannelMessages):
-                # There are some broadcast channels that have a photo but this
-                # request doesn't retrieve it for some reason. Work around this
-                # issue by fetching the channel.
-                #
-                # We can't use the normal entity because that gives `ChatPhoto`
-                # but we want a proper `Photo`, so fetch full channel instead.
+
+            # Unconditionally fetch the full channel to obtain this photo and
+            # yield it with the rest (unless it's a duplicate).
+            seen_id = None
+            if isinstance(result, types.messages.ChannelMessages):
                 channel = await self.client(functions.channels.GetFullChannelRequest(self.request.peer))
                 photo = channel.full_chat.chat_photo
                 if isinstance(photo, types.Photo):
-                    self.buffer = [photo]
-                    self.total = 1
+                    self.buffer.append(photo)
+                    seen_id = photo.id
 
-                self.left = len(self.buffer)
-                return
+            self.buffer.extend(
+                x.action.photo for x in result.messages
+                if isinstance(x.action, types.MessageActionChatEditPhoto)
+                and x.action.photo.id != seen_id
+            )
 
-            self.buffer = [x.action.photo for x in result.messages
-                           if isinstance(x.action, types.MessageActionChatEditPhoto)]
             if len(result.messages) < self.request.limit:
                 self.left = len(self.buffer)
             elif result.messages:
@@ -489,7 +497,8 @@ class ChatMethods:
             settings: bool = None,
             pinned: bool = None,
             edit: bool = None,
-            delete: bool = None) -> _AdminLogIter:
+            delete: bool = None,
+            group_call: bool = None) -> _AdminLogIter:
         """
         Iterator over the admin log for the specified channel.
 
@@ -576,6 +585,9 @@ class ChatMethods:
             delete (`bool`):
                 If `True`, events of message deletions will be returned.
 
+            group_call (`bool`):
+                If `True`, events related to group calls will be returned.
+
         Yields
             Instances of `AdminLogEvent <telethon.tl.custom.adminlogevent.AdminLogEvent>`.
 
@@ -607,7 +619,8 @@ class ChatMethods:
             settings=settings,
             pinned=pinned,
             edit=edit,
-            delete=delete
+            delete=delete,
+            group_call=group_call
         )
 
     async def get_admin_log(
@@ -805,6 +818,8 @@ class ChatMethods:
             invite_users: bool = None,
             pin_messages: bool = None,
             add_admins: bool = None,
+            manage_call: bool = True,
+            anonymous: bool = None,
             is_admin: bool = None,
             title: str = None) -> types.Updates:
         """
@@ -848,6 +863,21 @@ class ChatMethods:
             add_admins (`bool`, optional):
                 Whether the user will be able to add admins.
 
+            manage_call (`bool`, optional):
+                Whether the user will be able to manage group calls.
+
+            anonymous (`bool`, optional):
+                Whether the user will remain anonymous when sending messages.
+                The sender of the anonymous messages becomes the group itself.
+
+                .. note::
+
+                    Users may be able to identify the anonymous admin by its
+                    custom title, so additional care is needed when using both
+                    ``anonymous`` and custom titles. For example, if multiple
+                    anonymous admins share the same title, users won't be able
+                    to distinguish them.
+
             is_admin (`bool`, optional):
                 Whether the user will be an admin in the chat.
                 This will only work in small group chats.
@@ -887,7 +917,8 @@ class ChatMethods:
 
         perm_names = (
             'change_info', 'post_messages', 'edit_messages', 'delete_messages',
-            'ban_users', 'invite_users', 'pin_messages', 'add_admins'
+            'ban_users', 'invite_users', 'pin_messages', 'add_admins',
+            'anonymous', 'manage_call',
         )
 
         ty = helpers._entity_type(entity)
@@ -1104,11 +1135,16 @@ class ChatMethods:
             user (`entity`, optional):
                 The user to kick.
 
+        Returns
+            Returns the service `Message <telethon.tl.custom.message.Message>`
+            produced about a user being kicked, if any.
+
         Example
             .. code-block:: python
 
-                # Kick some user from some chat
-                await client.kick_participant(chat, user)
+                # Kick some user from some chat, and deleting the service message
+                msg = await client.kick_participant(chat, user)
+                await msg.delete()
 
                 # Leaving chat
                 await client.kick_participant(chat, 'me')
@@ -1120,15 +1156,18 @@ class ChatMethods:
 
         ty = helpers._entity_type(entity)
         if ty == helpers._EntityType.CHAT:
-            await self(functions.messages.DeleteChatUserRequest(entity.chat_id, user))
+            resp = await self(functions.messages.DeleteChatUserRequest(entity.chat_id, user))
         elif ty == helpers._EntityType.CHANNEL:
             if isinstance(user, types.InputPeerSelf):
-                await self(functions.channels.LeaveChannelRequest(entity))
+                # Despite no longer being in the channel, the account still
+                # seems to get the service message.
+                resp = await self(functions.channels.LeaveChannelRequest(entity))
             else:
-                await self(functions.channels.EditBannedRequest(
+                resp = await self(functions.channels.EditBannedRequest(
                     channel=entity,
                     user_id=user,
-                    banned_rights=types.ChatBannedRights(until_date=None, view_messages=True)
+                    banned_rights=types.ChatBannedRights(
+                        until_date=None, view_messages=True)
                 ))
                 await asyncio.sleep(0.5)
                 await self(functions.channels.EditBannedRequest(
@@ -1138,6 +1177,63 @@ class ChatMethods:
                 ))
         else:
             raise ValueError('You must pass either a channel or a chat')
+
+        return self._get_response_message(None, resp, entity)
+
+    async def get_permissions(
+            self: 'TelegramClient',
+            entity: 'hints.EntityLike',
+            user: 'hints.EntityLike'
+    ) -> 'typing.Optional[custom.ParticipantPermissions]':
+        """
+        Fetches the permissions of a user in a specific chat or channel.
+
+        .. note::
+
+            This request has to fetch the entire chat for small group chats,
+            which can get somewhat expensive, so use of a cache is advised.
+
+        Arguments
+            entity (`entity`):
+                The channel or chat the user is participant of.
+
+            user (`entity`):
+                Target user.
+
+        Returns
+            A `ParticipantPermissions <telethon.tl.custom.participantpermissions.ParticipantPermissions>`
+            instance. Refer to its documentation to see what properties are
+            available.
+
+        Example
+            .. code-block:: python
+
+                permissions = await client.get_permissions(chat, user)
+                if permissions.is_admin:
+                    # do something
+        """
+        entity = await self.get_input_entity(entity)
+        user = await self.get_input_entity(user)
+        if helpers._entity_type(user) != helpers._EntityType.USER:
+            raise ValueError('You must pass a user entity')
+        if helpers._entity_type(entity) == helpers._EntityType.CHANNEL:
+            participant = await self(functions.channels.GetParticipantRequest(
+                entity,
+                user
+            ))
+            return custom.ParticipantPermissions(participant.participant, False)
+        elif helpers._entity_type(entity) == helpers._EntityType.CHAT:
+            chat = await self(functions.messages.GetFullChatRequest(
+                entity
+            ))
+            if isinstance(user, types.InputPeerSelf):
+                user = await self.get_me(input_peer=True)
+            for participant in chat.full_chat.participants.participants:
+                if participant.user_id == user.user_id:
+                    return custom.ParticipantPermissions(participant, True)
+            raise errors.UserNotParticipantError(None)
+
+        raise ValueError('You must pass either a channel or a chat')
 
     async def get_stats(
             self: 'TelegramClient',
@@ -1178,7 +1274,7 @@ class ChatMethods:
         """
         entity = await self.get_input_entity(entity)
         if helpers._entity_type(entity) != helpers._EntityType.CHANNEL:
-            raise TypeError('You must pass a user entity')
+            raise TypeError('You must pass a channel entity')
 
         # Don't bother fetching the Channel entity (costs a request), instead
         # try to guess and if it fails we know it's the other one (best case

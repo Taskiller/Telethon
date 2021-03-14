@@ -31,16 +31,18 @@ class ChatAction(EventBuilder):
     """
     @classmethod
     def build(cls, update, others=None, self_id=None):
-        if isinstance(update, types.UpdateChannelPinnedMessage) and update.id == 0:
-            # Telegram does not always send
-            # UpdateChannelPinnedMessage for new pins
-            # but always for unpin, with update.id = 0
+        # Rely on specific pin updates for unpins, but otherwise ignore them
+        # for new pins (we'd rather handle the new service message with pin,
+        # so that we can act on that message').
+        if isinstance(update, types.UpdatePinnedChannelMessages) and not update.pinned:
             return cls.Event(types.PeerChannel(update.channel_id),
-                             unpin=True)
+                             pin_ids=update.messages,
+                             pin=update.pinned)
 
-        elif isinstance(update, types.UpdateChatPinnedMessage) and update.id == 0:
-            return cls.Event(types.PeerChat(update.chat_id),
-                             unpin=True)
+        elif isinstance(update, types.UpdatePinnedMessages) and not update.pinned:
+            return cls.Event(update.peer,
+                             pin_ids=update.messages,
+                             pin=update.pinned)
 
         elif isinstance(update, types.UpdateChatParticipantAdd):
             return cls.Event(types.PeerChat(update.chat_id),
@@ -52,20 +54,9 @@ class ChatAction(EventBuilder):
                              kicked_by=True,
                              users=update.user_id)
 
-        elif isinstance(update, types.UpdateChannel):
-            # We rely on the fact that update._entities is set by _process_update
-            # This update only has the channel ID, and Telegram *should* have sent
-            # the entity in the Updates.chats list. If it did, check Channel.left
-            # to determine what happened.
-            peer = types.PeerChannel(update.channel_id)
-            channel = update._entities.get(utils.get_peer_id(peer))
-            if channel is not None:
-                if isinstance(channel, types.ChannelForbidden) or channel.left:
-                    return cls.Event(peer,
-                                     kicked_by=True)
-                else:
-                    return cls.Event(peer,
-                                     added_by=True)
+        # UpdateChannel is sent if we leave a channel, and the update._entities
+        # set by _process_update would let us make some guesses. However it's
+        # better not to rely on this. Rely only in MessageActionChatDeleteUser.
 
         elif (isinstance(update, (
                 types.UpdateNewMessage, types.UpdateNewChannelMessage))
@@ -77,14 +68,14 @@ class ChatAction(EventBuilder):
                                  added_by=True,
                                  users=msg.from_id)
             elif isinstance(action, types.MessageActionChatAddUser):
-                # If a user adds itself, it means they joined
-                added_by = ([msg.from_id] == action.users) or msg.from_id
+                # If a user adds itself, it means they joined via the public chat username
+                added_by = ([msg.sender_id] == action.users) or msg.from_id
                 return cls.Event(msg,
                                  added_by=added_by,
                                  users=action.users)
             elif isinstance(action, types.MessageActionChatDeleteUser):
                 return cls.Event(msg,
-                                 kicked_by=msg.from_id or True,
+                                 kicked_by=utils.get_peer_id(msg.from_id) if msg.from_id else True,
                                  users=action.user_id)
             elif isinstance(action, types.MessageActionChatCreate):
                 return cls.Event(msg,
@@ -108,12 +99,9 @@ class ChatAction(EventBuilder):
                 return cls.Event(msg,
                                  users=msg.from_id,
                                  new_photo=True)
-            elif isinstance(action, types.MessageActionPinMessage) and msg.reply_to_msg_id:
-                # Seems to not be reliable on unpins, but when pinning
-                # we prefer this because we know who caused it.
+            elif isinstance(action, types.MessageActionPinMessage) and msg.reply_to:
                 return cls.Event(msg,
-                                 users=msg.from_id,
-                                 new_pin=msg.reply_to_msg_id)
+                                 pin_ids=[msg.reply_to_msg_id])
 
     class Event(EventCommon):
         """
@@ -153,19 +141,22 @@ class ChatAction(EventBuilder):
             unpin (`bool`):
                 `True` if the existing pin gets unpinned.
         """
-        def __init__(self, where, new_pin=None, new_photo=None,
+        def __init__(self, where, new_photo=None,
                      added_by=None, kicked_by=None, created=None,
-                     users=None, new_title=None, unpin=None):
+                     users=None, new_title=None, pin_ids=None, pin=None):
             if isinstance(where, types.MessageService):
                 self.action_message = where
-                where = where.to_id
+                where = where.peer_id
             else:
                 self.action_message = None
 
-            super().__init__(chat_peer=where, msg_id=new_pin)
+            # TODO needs some testing (can there be more than one id, and do they follow pin order?)
+            #      same in get_pinned_message
+            super().__init__(chat_peer=where, msg_id=pin_ids[0] if pin_ids else None)
 
-            self.new_pin = isinstance(new_pin, int)
-            self._pinned_message = new_pin
+            self.new_pin = pin_ids is not None
+            self._pin_ids = pin_ids
+            self._pinned_messages = None
 
             self.new_photo = new_photo is not None
             self.photo = \
@@ -193,16 +184,16 @@ class ChatAction(EventBuilder):
             self.created = bool(created)
 
             if isinstance(users, list):
-                self._user_ids = users
+                self._user_ids = [utils.get_peer_id(u) for u in users]
             elif users:
-                self._user_ids = [users]
+                self._user_ids = [utils.get_peer_id(users)]
             else:
                 self._user_ids = []
 
             self._users = None
             self._input_users = None
             self.new_title = new_title
-            self.unpin = unpin
+            self.unpin = not pin
 
         def _set_client(self, client):
             super()._set_client(client)
@@ -256,16 +247,26 @@ class ChatAction(EventBuilder):
             If ``new_pin`` is `True`, this returns the `Message
             <telethon.tl.custom.message.Message>` object that was pinned.
             """
-            if self._pinned_message == 0:
-                return None
+            if self._pinned_messages is None:
+                await self.get_pinned_messages()
 
-            if isinstance(self._pinned_message, int)\
-                    and await self.get_input_chat():
-                self._pinned_message = await self._client.get_messages(
-                    self._input_chat, ids=self._pinned_message)
+            if self._pinned_messages:
+                return self._pinned_messages[0]
 
-            if isinstance(self._pinned_message, types.Message):
-                return self._pinned_message
+        async def get_pinned_messages(self):
+            """
+            If ``new_pin`` is `True`, this returns a `list` of `Message
+            <telethon.tl.custom.message.Message>` objects that were pinned.
+            """
+            if not self._pin_ids:
+                return self._pin_ids  # either None or empty list
+
+            chat = await self.get_input_chat()
+            if chat:
+                self._pinned_messages = await self._client.get_messages(
+                    self._input_chat, ids=self._pin_ids)
+
+            return self._pinned_messages
 
         @property
         def added_by(self):

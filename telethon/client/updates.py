@@ -2,8 +2,11 @@ import asyncio
 import inspect
 import itertools
 import random
+import sys
 import time
+import traceback
 import typing
+import logging
 
 from .. import events, utils, errors
 from ..events.common import EventBuilder, EventCommon
@@ -309,14 +312,14 @@ class UpdateMethods:
         channel_id = self._state_cache.get_channel_id(update)
         args = (update, others, channel_id, self._state_cache[channel_id])
         if self._dispatching_updates_queue is None:
-            task = self._loop.create_task(self._dispatch_update(*args))
+            task = self.loop.create_task(self._dispatch_update(*args))
             self._updates_queue.add(task)
             task.add_done_callback(lambda _: self._updates_queue.discard(task))
         else:
             self._updates_queue.put_nowait(args)
             if not self._dispatching_updates_queue.is_set():
                 self._dispatching_updates_queue.set()
-                self._loop.create_task(self._dispatch_queue_updates())
+                self.loop.create_task(self._dispatch_queue_updates())
 
         self._state_cache.update(update)
 
@@ -348,7 +351,7 @@ class UpdateMethods:
             # We also don't really care about their result.
             # Just send them periodically.
             try:
-                self._sender.send(functions.PingRequest(rnd()))
+                self._sender._keepalive_ping(rnd())
             except (ConnectionError, asyncio.CancelledError):
                 return
 
@@ -397,6 +400,11 @@ class UpdateMethods:
                     # the channel. Because these "happen sporadically" (#1428)
                     # we should be okay (no flood waits) even if more occur.
                     pass
+                except ValueError:
+                    # There is a chance that GetFullChannelRequest and GetDifferenceRequest
+                    # inside the _get_difference() function will end up with
+                    # ValueError("Request was unsuccessful N time(s)") for whatever reasons.
+                    pass
 
         if not self._self_input_peer:
             # Some updates require our own ID, so we must make sure
@@ -405,7 +413,10 @@ class UpdateMethods:
             #
             # It will return `None` if we haven't logged in yet which is
             # fine, we will just retry next time anyway.
-            await self.get_me(input_peer=True)
+            try:
+                await self.get_me(input_peer=True)
+            except OSError:
+                pass  # might not have connection
 
         built = EventBuilderDict(self, update, others)
         for conv_set in self._conversations.values():
@@ -456,8 +467,7 @@ class UpdateMethods:
             except Exception as e:
                 if not isinstance(e, asyncio.CancelledError) or self.is_connected():
                     name = getattr(callback, '__name__', repr(callback))
-                    self._log[__name__].exception('Unhandled exception on %s',
-                                                  name)
+                    self._log[__name__].exception('Unhandled exception on %s', name)
 
     async def _dispatch_event(self: 'TelegramClient', event):
         """
@@ -498,8 +508,7 @@ class UpdateMethods:
             except Exception as e:
                 if not isinstance(e, asyncio.CancelledError) or self.is_connected():
                     name = getattr(callback, '__name__', repr(callback))
-                    self._log[__name__].exception('Unhandled exception on %s',
-                                                  name)
+                    self._log[__name__].exception('Unhandled exception on %s', name)
 
     async def _get_difference(self: 'TelegramClient', update, channel_id, pts_date):
         """
@@ -513,8 +522,13 @@ class UpdateMethods:
         self._log[__name__].debug('Getting difference for entities '
                                   'for %r', update.__class__)
         if channel_id:
+            # There are reports where we somehow call get channel difference
+            # with `InputPeerEmpty`. Check our assumptions to better debug
+            # this when it happens.
+            assert isinstance(channel_id, int), 'channel_id was {}, not int in {}'.format(type(channel_id), update)
             try:
-                where = await self.get_input_entity(channel_id)
+                # Wrap the ID inside a peer to ensure we get a channel back.
+                where = await self.get_input_entity(types.PeerChannel(channel_id))
             except ValueError:
                 # There's a high chance that this fails, since
                 # we are getting the difference to fetch entities.
@@ -597,8 +611,8 @@ class UpdateMethods:
             self._log[__name__].warning('Failed to get missed updates after '
                                         'reconnect: %r', e)
         except Exception:
-            self._log[__name__].exception('Unhandled exception while getting '
-                                          'update difference after reconnect')
+            self._log[__name__].exception(
+                'Unhandled exception while getting update difference after reconnect')
 
     # endregion
 
@@ -616,15 +630,8 @@ class EventBuilderDict:
         try:
             return self.__dict__[builder]
         except KeyError:
-            # Updates may arrive before login (like updateLoginToken) and we
-            # won't have our self ID yet (anyway only new messages need it).
-            self_id = (
-                self.client._self_input_peer.user_id
-                if self.client._self_input_peer
-                else None
-            )
             event = self.__dict__[builder] = builder.build(
-                self.update, self.others, self_id)
+                self.update, self.others, self.client._self_id)
 
             if isinstance(event, EventCommon):
                 event.original_update = self.update

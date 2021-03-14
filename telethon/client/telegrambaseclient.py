@@ -25,8 +25,7 @@ DEFAULT_PORT = 443
 if typing.TYPE_CHECKING:
     from .telegramclient import TelegramClient
 
-__default_log__ = logging.getLogger(__base_name__)
-__default_log__.addHandler(logging.NullHandler())
+_base_log = logging.getLogger(__base_name__)
 
 
 # In seconds, how long to wait before disconnecting a exported sender.
@@ -110,6 +109,11 @@ class TelegramBaseClient(abc.ABC):
             function parameters for PySocks, like ``(type, 'hostname', port)``.
             See https://github.com/Anorov/PySocks#usage-1 for more.
 
+        local_addr (`str` | `tuple`, optional):
+            Local host address (and port, optionally) used to bind the socket to locally.
+            You only need to use this if you have multiple network cards and
+            want to use a specific one.
+
         timeout (`int` | `float`, optional):
             The timeout in seconds to be used when connecting.
             This is **not** the timeout to be used when ``await``'ing for
@@ -160,6 +164,12 @@ class TelegramBaseClient(abc.ABC):
             was for 21s, it would ``raise FloodWaitError`` instead. Values
             larger than a day (like ``float('inf')``) will be changed to a day.
 
+        raise_last_call_error (`bool`, optional):
+            When API calls fail in a way that causes Telethon to retry
+            automatically, should the RPC error of the last attempt be raised
+            instead of a generic ValueError. This is mostly useful for
+            detecting when Telegram has internal issues.
+
         device_model (`str`, optional):
             "Device model" to be sent when creating the initial connection.
             Defaults to 'PC (n)bit' derived from ``platform.uname().machine``, or its direct value if unknown.
@@ -209,13 +219,15 @@ class TelegramBaseClient(abc.ABC):
             connection: 'typing.Type[Connection]' = ConnectionTcpFull,
             use_ipv6: bool = False,
             proxy: typing.Union[tuple, dict] = None,
+            local_addr: typing.Union[str, tuple] = None,
             timeout: int = 10,
             request_retries: int = 5,
-            connection_retries: int =5,
+            connection_retries: int = 5,
             retry_delay: int = 1,
             auto_reconnect: bool = True,
             sequential_updates: bool = False,
             flood_sleep_threshold: int = 60,
+            raise_last_call_error: bool = False,
             device_model: str = None,
             system_version: str = None,
             app_version: str = None,
@@ -229,12 +241,11 @@ class TelegramBaseClient(abc.ABC):
                 "Refer to telethon.rtfd.io for more information.")
 
         self._use_ipv6 = use_ipv6
-        self._loop = asyncio.get_event_loop()
 
         if isinstance(base_logger, str):
             base_logger = logging.getLogger(base_logger)
         elif not isinstance(base_logger, logging.Logger):
-            base_logger = __default_log__
+            base_logger = _base_log
 
         class _Loggers(dict):
             def __missing__(self, key):
@@ -295,21 +306,34 @@ class TelegramBaseClient(abc.ABC):
         # TODO A better fix is obviously avoiding the use of `sock_connect`
         #
         # See https://github.com/LonamiWebs/Telethon/issues/1337 for details.
-        if not callable(getattr(self._loop, 'sock_connect', None)):
+        if not callable(getattr(self.loop, 'sock_connect', None)):
             raise TypeError(
                 'Event loop of type {} lacks `sock_connect`, which is needed to use proxies.\n\n'
                 'Change the event loop in use to use proxies:\n'
                 '# https://github.com/LonamiWebs/Telethon/issues/1337\n'
                 'import asyncio\n'
                 'asyncio.set_event_loop(asyncio.SelectorEventLoop())'.format(
-                    self._loop.__class__.__name__
+                    self.loop.__class__.__name__
                 )
             )
+
+        if local_addr is not None:
+            if use_ipv6 is False and ':' in local_addr:
+                raise TypeError(
+                    'A local IPv6 address must only be used with `use_ipv6=True`.'
+                )
+            elif use_ipv6 is True and ':' not in local_addr:
+                raise TypeError(
+                    '`use_ipv6=True` must only be used with a local IPv6 address.'
+                )
+
+        self._raise_last_call_error = raise_last_call_error
 
         self._request_retries = request_retries
         self._connection_retries = connection_retries
         self._retry_delay = retry_delay or 0
         self._proxy = proxy
+        self._local_addr = local_addr
         self._timeout = timeout
         self._auto_reconnect = auto_reconnect
 
@@ -329,18 +353,17 @@ class TelegramBaseClient(abc.ABC):
         else:
             default_device_model = system.machine
         default_system_version = re.sub(r'-.+','',system.release)
-        self._init_with = lambda x: functions.InvokeWithLayerRequest(
-            LAYER, functions.InitConnectionRequest(
-                api_id=self.api_id,
-                device_model=device_model or default_device_model or 'Unknown',
-                system_version=system_version or default_system_version or '1.0',
-                app_version=app_version or self.__version__,
-                lang_code=lang_code,
-                system_lang_code=system_lang_code,
-                lang_pack='',  # "langPacks are for official apps only"
-                query=x,
-                proxy=init_proxy
-            )
+
+        self._init_request = functions.InitConnectionRequest(
+            api_id=self.api_id,
+            device_model=device_model or default_device_model or 'Unknown',
+            system_version=system_version or default_system_version or '1.0',
+            app_version=app_version or self.__version__,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
+            lang_pack='',  # "langPacks are for official apps only"
+            query=None,
+            proxy=init_proxy
         )
 
         self._sender = MTProtoSender(
@@ -434,7 +457,7 @@ class TelegramBaseClient(abc.ABC):
                 # Join the task (wait for it to complete)
                 await task
         """
-        return self._loop
+        return asyncio.get_event_loop()
 
     @property
     def disconnected(self: 'TelegramClient') -> asyncio.Future:
@@ -492,7 +515,8 @@ class TelegramBaseClient(abc.ABC):
             self.session.port,
             self.session.dc_id,
             loggers=self._log,
-            proxy=self._proxy
+            proxy=self._proxy,
+            local_addr=self._local_addr
         )):
             # We don't want to init or modify anything if we were already connected
             return
@@ -500,10 +524,13 @@ class TelegramBaseClient(abc.ABC):
         self.session.auth_key = self._sender.auth_key
         self.session.save()
 
-        await self._sender.send(self._init_with(
-            functions.help.GetConfigRequest()))
+        self._init_request.query = functions.help.GetConfigRequest()
 
-        self._updates_handle = self._loop.create_task(self._update_loop())
+        await self._sender.send(functions.InvokeWithLayerRequest(
+            LAYER, self._init_request
+        ))
+
+        self._updates_handle = self.loop.create_task(self._update_loop())
 
     def is_connected(self: 'TelegramClient') -> bool:
         """
@@ -534,11 +561,11 @@ class TelegramBaseClient(abc.ABC):
                 # You don't need to use this if you used "with client"
                 await client.disconnect()
         """
-        if self._loop.is_running():
+        if self.loop.is_running():
             return self._disconnect_coro()
         else:
             try:
-                self._loop.run_until_complete(self._disconnect_coro())
+                self.loop.run_until_complete(self._disconnect_coro())
             except RuntimeError:
                 # Python 3.5.x complains when called from
                 # `__aexit__` and there were pending updates with:
@@ -547,16 +574,51 @@ class TelegramBaseClient(abc.ABC):
                 # However, it doesn't really make a lot of sense.
                 pass
 
+    def set_proxy(self: 'TelegramClient', proxy: typing.Union[tuple, dict]):
+        """
+        Changes the proxy which will be used on next (re)connection.
+
+        Method has no immediate effects if the client is currently connected.
+
+        The new proxy will take it's effect on the next reconnection attempt:
+            - on a call `await client.connect()` (after complete disconnect)
+            - on auto-reconnect attempt (e.g, after previous connection was lost)
+        """
+        init_proxy = None if not issubclass(self._connection, TcpMTProxy) else \
+            types.InputClientProxy(*self._connection.address_info(proxy))
+
+        self._init_request.proxy = init_proxy
+        self._proxy = proxy
+
+        # While `await client.connect()` passes new proxy on each new call,
+        # auto-reconnect attempts use already set up `_connection` inside
+        # the `_sender`, so the only way to change proxy between those
+        # is to directly inject parameters.
+
+        connection = getattr(self._sender, "_connection", None)
+        if connection:
+            if isinstance(connection, TcpMTProxy):
+                connection._ip = proxy[0]
+                connection._port = proxy[1]
+            else:
+                connection._proxy = proxy
+
     async def _disconnect_coro(self: 'TelegramClient'):
         await self._disconnect()
 
         # Also clean-up all exported senders because we're done with them
         async with self._borrow_sender_lock:
             for state, sender in self._borrowed_senders.values():
-                if state.should_disconnect():
-                    # disconnect should never raise
-                    await sender.disconnect()
+                # Note that we're not checking for `state.should_disconnect()`.
+                # If the user wants to disconnect the client, ALL connections
+                # to Telegram (including exported senders) should be closed.
+                #
+                # Disconnect should never raise, so there's no try/except.
+                await sender.disconnect()
+                # Can't use `mark_disconnected` because it may be borrowed.
+                state._connected = False
 
+            # If any was borrowed
             self._borrowed_senders.clear()
 
         # trio's nurseries would handle this for us, but this is asyncio.
@@ -654,13 +716,13 @@ class TelegramBaseClient(abc.ABC):
             dc.port,
             dc.id,
             loggers=self._log,
-            proxy=self._proxy
+            proxy=self._proxy,
+            local_addr=self._local_addr
         ))
         self._log[__name__].info('Exporting auth for new borrowed sender in %s', dc)
         auth = await self(functions.auth.ExportAuthorizationRequest(dc_id))
-        req = self._init_with(functions.auth.ImportAuthorizationRequest(
-            id=auth.id, bytes=auth.bytes
-        ))
+        self._init_request.query = functions.auth.ImportAuthorizationRequest(id=auth.id, bytes=auth.bytes)
+        req = functions.InvokeWithLayerRequest(LAYER, self._init_request)
         await sender.send(req)
         return sender
 
@@ -689,7 +751,8 @@ class TelegramBaseClient(abc.ABC):
                     dc.port,
                     dc.id,
                     loggers=self._log,
-                    proxy=self._proxy
+                    proxy=self._proxy,
+                    local_addr=self._local_addr
                 ))
 
             state.add_borrow()

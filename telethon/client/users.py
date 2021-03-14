@@ -50,8 +50,9 @@ class UserMethods:
                     raise errors.FloodWaitError(request=r, capture=diff)
 
         request_index = 0
+        last_error = None
         self._last_request = time.time()
-        
+
         for attempt in retry_range(self._request_retries):
             try:
                 future = sender.send(request, ordered=ordered)
@@ -82,17 +83,21 @@ class UserMethods:
             except (errors.ServerError, errors.RpcCallFailError,
                     errors.RpcMcgetFailError, errors.InterdcCallErrorError,
                     errors.InterdcCallRichErrorError) as e:
+                last_error = e
                 self._log[__name__].warning(
                     'Telegram is having internal issues %s: %s',
                     e.__class__.__name__, e)
 
                 await asyncio.sleep(2)
             except (errors.FloodWaitError, errors.SlowModeWaitError, errors.FloodTestPhoneWaitError) as e:
+                last_error = e
                 if utils.is_list_like(request):
                     request = request[request_index]
 
-                self._flood_waited_requests\
-                    [request.CONSTRUCTOR_ID] = time.time() + e.seconds
+                # SLOW_MODE_WAIT is chat-specific, not request-specific
+                if not isinstance(e, errors.SlowModeWaitError):
+                    self._flood_waited_requests\
+                        [request.CONSTRUCTOR_ID] = time.time() + e.seconds
 
                 # In test servers, FLOOD_WAIT_0 has been observed, and sleeping for
                 # such a short amount will cause retries very fast leading to issues.
@@ -106,6 +111,7 @@ class UserMethods:
                     raise
             except (errors.PhoneMigrateError, errors.NetworkMigrateError,
                     errors.UserMigrateError) as e:
+                last_error = e
                 self._log[__name__].info('Phone migrated to %d', e.new_dc)
                 should_raise = isinstance(e, (
                     errors.PhoneMigrateError, errors.NetworkMigrateError
@@ -114,6 +120,8 @@ class UserMethods:
                     raise
                 await self._switch_dc(e.new_dc)
 
+        if self._raise_last_call_error and last_error is not None:
+            raise last_error
         raise ValueError('Request was unsuccessful {} time(s)'
                          .format(attempt))
 
@@ -157,6 +165,16 @@ class UserMethods:
             return self._self_input_peer if input_peer else me
         except errors.UnauthorizedError:
             return None
+
+    @property
+    def _self_id(self: 'TelegramClient') -> typing.Optional[int]:
+        """
+        Returns the ID of the logged-in user, if known.
+
+        This property is used in every update, and some like `updateLoginToken`
+        occur prior to login, so it gracefully handles when no ID is known yet.
+        """
+        return self._self_input_peer.user_id if self._self_input_peer else None
 
     async def is_bot(self: 'TelegramClient') -> bool:
         """
@@ -441,11 +459,15 @@ class UserMethods:
                 pass
 
         raise ValueError(
-            'Could not find the input entity for {!r}. Please read https://'
+            'Could not find the input entity for {} ({}). Please read https://'
             'docs.telethon.dev/en/latest/concepts/entities.html to'
             ' find out more details.'
-            .format(peer)
+            .format(peer, type(peer).__name__)
         )
+
+    async def _get_peer(self: 'TelegramClient', peer: 'hints.EntityLike'):
+        i, cls = utils.resolve_id(await self.get_peer_id(peer))
+        return cls(i)
 
     async def get_peer_id(
             self: 'TelegramClient',
@@ -577,6 +599,8 @@ class UserMethods:
                     notify.peer = await self.get_input_entity(notify.peer)
                 return notify
         except AttributeError:
-            return types.InputNotifyPeer(await self.get_input_entity(notify))
+            pass
+
+        return types.InputNotifyPeer(await self.get_input_entity(notify))
 
     # endregion
